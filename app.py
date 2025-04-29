@@ -13,9 +13,6 @@ import math
 
 # Import helper modules
 from text_processor import process_text
-from image_processor import process_image_for_storage
-from ward_search import search_ward_by_coordinates_firestore
-
 # Add an admin key for authentication
 ADMIN_KEY = os.getenv('ADMIN_KEY', 'default_admin_key')  # Replace with a secure key
 
