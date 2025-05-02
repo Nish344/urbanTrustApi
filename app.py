@@ -1,5 +1,5 @@
 # app.py
-from flask import Flask, request, jsonify
+from flask import Flask, Response, request, jsonify
 import os
 import numpy as np
 from PIL import Image
@@ -12,8 +12,9 @@ from firebase_admin import credentials, firestore
 import math
 import logging
 
-from image_process import verify_image_matches_description
+from image_process import verify_image_matches_description, describe_image
 from translate import translate_to_kannada
+from notifications import WardNotificationSystem  # Import the updated notification system
 
 
 # Initialize logging
@@ -25,54 +26,38 @@ app = Flask(__name__)
 # Add an admin key for authentication
 ADMIN_KEY = os.getenv('ADMIN_KEY', 'default_admin_key')  # Replace with a secure key
 
-# Placeholder functions for the imported modules
-def process_text(text, models):
-    """
-    Process text to create embeddings
-    This is a placeholder for the missing text_process module
-    """
-    logger.info(f"Processing text: {text[:50]}...")
-    # Create a simple dummy embedding for now
-    text_tokenizer = models.get('text_tokenizer')
-    text_model = models.get('text_model')
-    
-    if text_tokenizer and text_model:
-        # Here we would use the models to create proper embeddings
-        # For now, just return a random embedding of appropriate size
-        return {'embedding': np.random.rand(768)}  # BERT base has 768 dimensions
-    else:
-        # If models aren't available, return random vector
-        return {'embedding': np.random.rand(768)}
-
-
 
 def process_image_for_storage(image_data):
     """
-    Process and validate the image data for storage
+    Compress, resize and validate image data before storing in Firestore
     """
     try:
         if image_data and image_data.startswith('data:image'):
-            # Extract the base64 part if it's a data URL
             image_base64 = image_data.split(',')[1]
         else:
             image_base64 = image_data
-            
-        # Validate that it's actually an image
-        try:
-            image_bytes = base64.b64decode(image_base64)
-            img = Image.open(io.BytesIO(image_bytes))
-            # Optionally resize or compress the image here
-            
-            # Convert back to base64 for storage
-            buffered = io.BytesIO()
-            img.save(buffered, format=img.format if img.format else 'JPEG')
-            return base64.b64encode(buffered.getvalue()).decode('utf-8')
-        except Exception as e:
-            logger.error(f"Invalid image data: {str(e)}")
-            return None
+
+        image_bytes = base64.b64decode(image_base64)
+        img = Image.open(io.BytesIO(image_bytes))
+
+        # Resize image (e.g., max 800x800)
+        img.thumbnail((800, 800))
+
+        # Strip metadata and convert to JPEG
+        img_no_metadata = Image.new(img.mode, img.size)
+        img_no_metadata.putdata(list(img.getdata()))
+
+        # Save with compression
+        buffered = io.BytesIO()
+        img_no_metadata = img_no_metadata.convert("RGB")
+        img_no_metadata.save(buffered, format='JPEG', quality=70)
+
+        return base64.b64encode(buffered.getvalue()).decode('utf-8')
+
     except Exception as e:
         logger.error(f"Error processing image: {str(e)}")
         return None
+
 
 # Haversine formula to calculate distance between two GPS coordinates
 def haversine_distance(lat1, lon1, lat2, lon2):
@@ -144,7 +129,7 @@ def search_ward_by_coordinates_firestore(longitude, latitude):
         return "Unknown Ward", "unknown"
 
 # Store issue in Firestore
-def store_issue(issue_data, text_embedding, category):
+def store_issue(issue_data, category):
     try:
         db = app.config['db']
         if not db:
@@ -157,15 +142,13 @@ def store_issue(issue_data, text_embedding, category):
         created_at = datetime.now().isoformat()
         
         # Convert numpy embedding to base64 for storage
-        text_embedding_base64 = base64.b64encode(text_embedding.tobytes()).decode('utf-8')
         
         # Check for nearby similar issues
         nearby_issues = find_nearby_issues(issue_data['latitude'], issue_data['longitude'], radius=50)
         similar_issues = []
         
-        # Get ward ID from coordinates
-        _, ward_id = search_ward_by_coordinates_firestore(issue_data['longitude'], issue_data['latitude'])
-
+        # No need to get ward ID here, since we'll determine it in the notification process
+        
         # Count similar issues in the vicinity
         for issue in nearby_issues:
             if issue.get('category') == category:
@@ -173,7 +156,7 @@ def store_issue(issue_data, text_embedding, category):
         
         similar_count = len(similar_issues)
 
-        # Store issue in Firestore
+        # Store issue in Firestore with ward_assigned defaulted to false
         issue_ref = db.collection('issues').document(issue_id)
         issue_ref.set({
             'latitude': issue_data['latitude'],
@@ -182,12 +165,13 @@ def store_issue(issue_data, text_embedding, category):
             'category_kannada': issue_data.get('category_kannada', ''),
             'description': issue_data.get('description', ''),
             'description_kannada': issue_data.get('description_kannada', ''),
+            'user_id': issue_data.get('user_id', ''),
             'status': 'open',
             'created_at': created_at,
             'image': issue_data.get('image', ''),
-            'text_embedding': text_embedding_base64,
             'similar_count': similar_count,
-            'ward_id': ward_id
+            'ward_assigned': False,  # Default to false until determined by notification system
+            'notification_sent': False  # Default to false
         })
         
         logger.info(f"Issue stored with ID: {issue_id}")
@@ -293,6 +277,7 @@ def report_issue():
         category = data.get('category')
         description = data.get('description', '')
         image_data = data.get('image')
+        user_id = data.get('user_id', '')
 
         if not all([latitude, longitude, category]):
             return jsonify({
@@ -304,37 +289,42 @@ def report_issue():
 
         # Process image for storage
         image_base64 = process_image_for_storage(image_data) if image_data else None
+        image_result = verify_image_matches_description(image_base64, description, category=category)
 
         # Verify image matches description
-        if image_base64 and not verify_image_matches_description(image_base64, description):
+        if image_base64 and not image_result['match']:
             return jsonify({
                 'success': False,
                 'message': 'Image does not match the description.'
             }), 400
-
+        category = image_result['category']
+        description = image_result['description']
         # Translate to Kannada
         category_kannada = translate_to_kannada(category)
         description_kannada = translate_to_kannada(description) if description else ""
 
-        # Get text embedding
-        text_result = process_text(description, models)
-
         issue_data = {
             'latitude': latitude,
             'longitude': longitude,
-            'category': category,
+            'category': image_result['category'],
             'category_kannada': category_kannada,
             'description': description,
             'description_kannada': description_kannada,
-            'image': image_base64
+            'image': image_base64,
+            'user_id': user_id
         }
 
-        issue_id = store_issue(issue_data, text_result['embedding'], category)
+        # Store the issue first
+        issue_id = store_issue(issue_data, category)
+
+        # After storing, send notifications if a ward is found for the coordinates
+        ward_notified = WardNotificationSystem.process_new_issue(issue_id)
 
         return jsonify({
             'success': True,
             'issue_id': issue_id,
-            'message': 'Issue reported successfully'
+            'ward_notified': ward_notified,
+            'message': 'Issue reported successfully' + (', ward notified' if ward_notified else ', no matching ward found')
         })
     except Exception as e:
         logger.error(f"Error in report-issue: {str(e)}")
@@ -342,6 +332,26 @@ def report_issue():
             'success': False,
             'message': f'Error reporting issue: {str(e)}'
         }), 500
+    
+@app.route('/describe', methods=['POST'])
+def describe():
+    try:
+        data = request.json
+        image_data = data.get('image')
+
+        # Process image for storage
+        image_base64 = process_image_for_storage(image_data) if image_data else None
+        image_result = describe_image(image_base64)
+        
+
+        return image_result
+    except Exception as e:
+        logger.error(f"Error in describing-issue: {str(e)}")
+        return jsonify({
+            'success': False,
+            'message': f'Error describing issue: {str(e)}'
+        }), 500
+        
 
 # Get nearby issues
 @app.route('/issues-nearby', methods=['GET'])
@@ -395,7 +405,10 @@ def get_issue(issue_id):
                 'description': issue_data.get('description'),
                 'status': issue_data.get('status'),
                 'created_at': issue_data.get('created_at'),
-                'similar_count': issue_data.get('similar_count', 0)
+                'similar_count': issue_data.get('similar_count', 0),
+                'ward_assigned': issue_data.get('ward_assigned', False),
+                'ward_name': issue_data.get('ward_name', 'Not assigned'),
+                'notification_sent': issue_data.get('notification_sent', False)
             }
         })
     except Exception as e:
@@ -433,4 +446,4 @@ def initialize_app(app):
 app = initialize_app(app)
 
 if __name__ == '__main__':
-    app.run(debug=True)
+    app.run(debug=True, host='0.0.0.0', port=5001)

@@ -8,7 +8,7 @@ import io
 import time
 
 # Constants
-BASE_URL = "http://127.0.0.1:5000"  # Change if your Flask app is running on a different URL
+BASE_URL = "http://127.0.0.1:5001"  # Change if your Flask app is running on a different URL
 
 def encode_image(image_path):
     """Encode an image to base64 for API request"""

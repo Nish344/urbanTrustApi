@@ -1,10 +1,9 @@
 # translate.py
 
 import google.generativeai as genai
-
+import os
 # Configure Gemini API
-genai.configure(api_key="AIzaSyDKlh1S1jfkZhW-e6cZDSaWFEfEb8WSvOM")  # Replace with your actual API key
-
+genai.configure(api_key=os.getenv("GEMINI_API"))
 # Load the model
 model = genai.GenerativeModel(model_name="gemini-1.5-pro-latest")
 
